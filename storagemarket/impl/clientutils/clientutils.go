@@ -52,14 +52,8 @@ func CommP(ctx context.Context, bs bstore.Blockstore, data *storagemarket.DataRe
 
 	// do a CARv1 traversal with the DFS selector.
 	sc := car.NewSelectiveCar(ctx, bs, []car.Dag{{Root: data.Root, Selector: selectorparse.CommonSelector_ExploreAllRecursively}}, car.MaxTraversalLinks(maxTraversalLinks))
-	prepared, err := sc.Prepare()
-	if err != nil {
-		return cid.Undef, 0, xerrors.Errorf("failed to prepare CAR: %w", err)
-	}
-
-	// write out the deterministic CARv1 payload to the CommP writer and calculate the CommP.
 	commpWriter := &writer.Writer{}
-	err = prepared.Dump(commpWriter)
+	err := sc.Write(commpWriter)
 	if err != nil {
 		return cid.Undef, 0, xerrors.Errorf("failed to write CARv1 to commP writer: %w", err)
 	}
