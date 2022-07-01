@@ -2,8 +2,17 @@ package providerstates
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
+	"io/ioutil"
+	"net"
+	"os"
+	"path"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +35,9 @@ import (
 	"github.com/filecoin-project/go-fil-markets/storagemarket"
 	"github.com/filecoin-project/go-fil-markets/storagemarket/impl/providerutils"
 	"github.com/filecoin-project/go-fil-markets/storagemarket/network"
+
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 var log = logging.Logger("providerstates")
@@ -404,6 +416,123 @@ func HandoffDeal(ctx fsm.Context, environment ProviderDealEnvironment, deal stor
 	return ctx.Trigger(storagemarket.ProviderEventDealHandedOff)
 }
 
+var (
+	MongoHandler *mongo.Database
+)
+
+type Machine struct {
+	ID primitive.ObjectID `json:"id" bson:"_id,omitempty"` // ObjectId
+
+	Ip string `json:"ip" bson:"ip"`
+
+	Role string `json:"role" bson:"role"` // lotus/miner/winPost/wdPost/worker/storage
+
+	WorkerLocalPath string `json:"worker_local_storage_path" bson:"worker_local_storage_path"` // worker
+	WorkerMountPath string `json:"worker_mount_path" bson:"worker_mount_path"`                 // worker
+	MinerLocalPath  string `json:"miner_local_storage_path" bson:"miner_local_storage_path"`   // miner
+	MinerMountPath  string `json:"miner_mount_path" bson:"miner_mount_path"`                   // miner
+	StoragePath     string `json:"storage_path" bson:"storage_path"`                           // storage
+
+	NodeId    string `json:"node_id" bson:"node_id"`
+	ClusterId string `json:"cluster_id" bson:"cluster_id"`
+
+	MaxParallelMigrateSectorSize uint64 `json:"max_parallel_migrate_sector_size" bson:"MaxParallelMigrateSectorSize"`
+	ParallelMigrateSectorSize    uint64 `json:"parallelmigratesectorsize" bson:"parallelmigratesectorsize"`
+	MaxStoreSectorSize           uint64 `json:"max_store_sector_size" bson:"MaxStoreSectorSize"`
+	StoreSectorSize              uint64 `json:"storesectorsize" bson:"storesectorsize"`
+	Status                       int64  `json:"status" bson:"Status"`
+
+	CreatedAt int64  `json:"created_at" bson:"created_at"`
+	CreatedBy string `json:"created_by" bson:"created_by"`
+	UpdatedAt int64  `json:"updated_at" bson:"updated_at"`
+	UpdatedBy string `json:"updated_by" bson:"updated_by"`
+}
+
+func init() {
+	url := os.Getenv("MONGO_URL")
+	MongoHandler = InitMongo(url, "lotus", 10*time.Second, 100)
+}
+
+func InitMongo(uri, name string, timeout time.Duration, num uint64) *mongo.Database {
+	_, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	//o := options.Client().ApplyURI(uri)
+	//o := options.Client().ApplyURI("mongodb://root:123456@124.220.208.74:27017/lotus?authSource=admin")
+	//o.SetMaxPoolSize(num)
+	//client, err := mongo.Connect(ctx, o)
+	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(uri).SetConnectTimeout(5*time.Second))
+	if err != nil {
+		panic(err)
+	}
+	return client.Database(name)
+}
+
+func WriteDataToFile(filePath string, data []byte) error {
+	exists, err := Exists(path.Dir(filePath))
+	if err != nil {
+		return xerrors.Errorf("check filePath %s failed", filePath)
+	}
+
+	if !exists {
+		if err := os.MkdirAll(path.Dir(filePath), 0755); err != nil {
+			return xerrors.Errorf("mkdirAll failed, %w", err)
+		}
+	}
+
+	err = ioutil.WriteFile(filePath, data, 0666)
+	if err != nil {
+		return xerrors.Errorf("write file failed, %w", err)
+	}
+
+	return nil
+}
+
+func Exists(filePath string) (bool, error) {
+	_, err := os.Stat(filePath)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return true, err
+}
+
+func GetLocalIPv4s() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+
+	for _, a := range addrs {
+		// 检查ip地址判断是否回环地址
+		if ipNet, ok := a.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
+			if strings.HasPrefix(ipNet.IP.String(), "192.168") {
+				return ipNet.IP.String()
+			}
+		}
+	}
+	return ""
+}
+
+func FindOneMachine(filter interface{}) (*Machine, error) {
+	var machines Machine
+	var err error
+
+	singleResult := MongoHandler.Collection("machines").FindOne(context.TODO(), filter)
+	if err = singleResult.Err(); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if err = singleResult.Decode(&machines); err != nil {
+		return nil, err
+	}
+	return &machines, nil
+}
+
 func handoffDeal(ctx context.Context, environment ProviderDealEnvironment, deal storagemarket.MinerDeal, reader io.ReadSeeker, payloadSize uint64) (*storagemarket.PackingResult, error) {
 	// because we use the PadReader directly during Add Piece we need to produce the
 	// correct amount of zeroes
@@ -412,6 +541,32 @@ func handoffDeal(ctx context.Context, environment ProviderDealEnvironment, deal 
 	paddedReader, err := shared.NewInflatorReader(reader, payloadSize, deal.Proposal.PieceSize.Unpadded())
 	if err != nil {
 		return nil, err
+	}
+
+	minerMachine, err := FindOneMachine(bson.M{
+		"ip":   GetLocalIPv4s(),
+		"role": "miner",
+	})
+	p := filepath.Join(minerMachine.MinerLocalPath, "DealFileSets", strconv.Itoa(int(deal.DealID))+"-"+strconv.Itoa(int(deal.SectorNumber)))
+	meteInfoPath := filepath.Join(p, "mete")
+	dealInfoPath := filepath.Join(p, fmt.Sprintf("%v", deal.ProposalCid))
+
+	meteInfoBytes, err := json.Marshal(deal)
+	if err != nil {
+		fmt.Println(err)
+	}
+	err = WriteDataToFile(meteInfoPath, meteInfoBytes)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	dealInfo, err := io.ReadAll(paddedReader)
+	if err != nil {
+		fmt.Println(err)
+	}
+	err = WriteDataToFile(dealInfoPath, dealInfo)
+	if err != nil {
+		fmt.Println(err)
 	}
 
 	return environment.Node().OnDealComplete(

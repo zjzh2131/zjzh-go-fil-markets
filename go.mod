@@ -58,6 +58,7 @@ require (
 	github.com/stretchr/testify v1.7.0
 	github.com/whyrusleeping/cbor v0.0.0-20171005072247-63513f603b11
 	github.com/whyrusleeping/cbor-gen v0.0.0-20220302191723-37c43cae8e14
+	go.mongodb.org/mongo-driver v1.9.1
 	golang.org/x/crypto v0.0.0-20211209193657-4570a0811e8b // indirect
 	golang.org/x/exp v0.0.0-20210715201039-d37aa40e8013
 	golang.org/x/net v0.0.0-20211112202133-69e39bad7dc2
